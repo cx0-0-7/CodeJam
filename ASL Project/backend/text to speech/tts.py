@@ -41,6 +41,10 @@ if __name__ == "__main__":
     
     # Ask for the desired file name
     file_name = input("Enter the file name for your MP3 (without extension): ")
+
+    #Ask for desired language audio
+    language = input("Enter the language (default is English, write 'es' for Spanish,"
+                           "'fr' for French, 'de' for German, etc.")
     
     # Set the folder path
     folder = "MP3"
@@ -49,7 +53,7 @@ if __name__ == "__main__":
     save_path = os.path.join("ASL Project/backend/text to speech", folder, f"{file_name}.mp3")
     
     # Convert and save
-    audio_stream = convert_text_to_audio(user_text, save_path=save_path)
+    audio_stream = convert_text_to_audio(user_text, lang = language, save_path=save_path)
     
     if audio_stream:
         print(f"TTS conversion successful! Your file is saved at: {os.path.abspath(save_path)}")
