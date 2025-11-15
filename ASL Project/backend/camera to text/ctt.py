@@ -1,118 +1,271 @@
+"""
+Voice-Controlled Webcam — Full Rewrite
+
+Features:
+- Say the trigger word (default: "picture") to save the current webcam frame to Desktop.
+- Robust microphone detection with fallback scanning.
+- Non-blocking speech recognition in a worker thread.
+- Thread-safe sharing of the last captured frame (uses a lock).
+- Clear on-screen status and transcription display.
+- Proper thread-lifecycle handling to avoid overlapping recognition threads.
+- Desktop-compatible save path (Windows/macOS/Linux).
+"""
+
 import cv2
 import speech_recognition as sr
 import time
-# We still import MediaPipe and HandTracker, but they will be ignored in the main loop
-# if we are only focusing on Speech-to-Text for now.
-import mediapipe as mp 
-import numpy as np 
+import threading
+import queue
+import numpy as np
+import pyaudio
+import os
+import sys
+import traceback
 
-# --- SPEECH RECOGNITION FUNCTION ---
-def record_and_transcribe():
-    """Records audio from the microphone and transcribes it using Google's API."""
-    recognizer = sr.Recognizer()
+# ---------------------------
+# CONFIGURATION (edit here)
+# ---------------------------
+TIME_TO_LISTEN = 4.0          # seconds between listening attempts
+PHRASE_TIME_LIMIT = 3         # seconds max to listen per attempt
+SCREENSHOT_COMMAND = "picture"
+VIDEO_SOURCE = 0              # cv2.VideoCapture index
+SHOW_WINDOW_NAME = "Speech Command Shooter"
+FONT = cv2.FONT_HERSHEY_SIMPLEX
 
-    # Use microphone as input
-    with sr.Microphone() as source:
-        print("\n[🎤] Listening...")
-        # Calibrate the recognizer
-        recognizer.adjust_for_ambient_noise(source, duration=0.5) 
-        
-        # We will listen for a fixed, short duration to avoid blocking too long
-        # This makes the app responsive while transcribing.
+# ---------------------------
+# SHARED / THREAD-SAFE OBJECTS
+# ---------------------------
+transcription_queue = queue.Queue()  # status updates (strings)
+command_queue = queue.Queue()        # commands (e.g., "TAKE_PICTURE")
+frame_lock = threading.Lock()        # protects last_frame_to_save
+last_frame_to_save = None
+
+# This event indicates whether a speech-worker is currently running.
+# It prevents starting another recognition while one is active.
+speech_worker_running = threading.Event()
+
+# ---------------------------
+# UTILITIES
+# ---------------------------
+def find_default_mic_index():
+    """
+    Attempt to return a reasonable microphone index for pyaudio.
+    Priority:
+      1) p.get_default_input_device_info()
+      2) first device with maxInputChannels > 0
+    Returns None if nothing usable is found.
+    """
+    try:
+        p = pyaudio.PyAudio()
         try:
-            # Listen for up to 3 seconds
-            audio = recognizer.listen(source, phrase_time_limit=3) 
-        except sr.WaitTimeoutError:
-            print("[❌] No speech detected within the timeout.")
-            return None
-        except Exception as e:
-            # Catch other potential issues during listening
-            print(f"[❌] An error occurred during listening: {e}")
-            return None
+            default_info = p.get_default_input_device_info()
+            default_index = int(default_info.get("index"))
+            p.terminate()
+            return default_index
+        except Exception:
+            # fallback: scan all devices
+            for i in range(p.get_device_count()):
+                try:
+                    info = p.get_device_info_by_index(i)
+                    if int(info.get("maxInputChannels", 0)) > 0:
+                        p.terminate()
+                        return i
+                except Exception:
+                    continue
+            p.terminate()
+    except Exception:
+        pass
+    return None
 
-    print("[⚙️] Processing audio...")
+def desktop_path():
+    """Return an existing Desktop path for the current user (cross-platform)."""
+    # Standard approach: try USERPROFILE (Windows) then HOME
+    try:
+        if sys.platform.startswith("win"):
+            userprofile = os.environ.get("USERPROFILE")
+            if userprofile:
+                path = os.path.join(userprofile, "Desktop")
+                return path
+        # macOS / Linux or fallback
+        home = os.path.expanduser("~")
+        path = os.path.join(home, "Desktop")
+        return path
+    except Exception:
+        return os.path.expanduser("~")
+
+def take_screenshot(img):
+    """
+    Save the provided BGR image to Desktop with a timestamped filename.
+    Returns a short status string for UI.
+    """
+    if img is None:
+        return "[❌ No frame to save]"
+
+    desk = desktop_path()
+    try:
+        os.makedirs(desk, exist_ok=True)
+    except Exception:
+        # If we can't make the desktop dir, fallback to home
+        desk = os.path.expanduser("~")
+
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    filename = f"webcam_shot_{timestamp}.jpg"
+    filepath = os.path.join(desk, filename)
 
     try:
-        # Recognition call
-        text = recognizer.recognize_google(audio)
-        print(f"📝 Transcribed: {text}")
-        return text
+        success = cv2.imwrite(filepath, img)
+        if success:
+            return f"[✅ Saved: {filename}]"
+        else:
+            return "[❌ cv2.imwrite failed]"
+    except Exception as e:
+        return f"[❌ Save error: {e}]"
+
+# ---------------------------
+# SPEECH WORKER (thread)
+# ---------------------------
+def record_and_transcribe_threaded(mic_index):
+    """
+    Worker function to capture audio and attempt to transcribe it.
+    Puts results into transcription_queue and commands into command_queue.
+    Uses speech_worker_running Event to signal running/finished.
+    """
+    recognizer = sr.Recognizer()
+    try:
+        # Mark as running
+        speech_worker_running.set()
+        transcription_queue.put("[🎤 Listening...]")
+
+        with sr.Microphone(device_index=mic_index) as source:
+            # Quick ambient calibration (short duration)
+            try:
+                recognizer.adjust_for_ambient_noise(source, duration=0.4)
+            except Exception:
+                # If calibration fails, continue — recognizer will still try
+                pass
+
+            audio = recognizer.listen(source, phrase_time_limit=PHRASE_TIME_LIMIT)
+    except Exception as e:
+        transcription_queue.put(f"[❌ Mic/listen error: {e}]")
+        speech_worker_running.clear()
+        return
+
+    transcription_queue.put("[⚙️ Processing audio...]")
+
+    try:
+        text = recognizer.recognize_google(audio).lower()
+        transcription_queue.put(f"📝 {text}")
+
+        # Command check
+        if SCREENSHOT_COMMAND in text:
+            command_queue.put("TAKE_PICTURE")
+            transcription_queue.put("[🖼️ Command received: saving picture]")
 
     except sr.UnknownValueError:
-        # This is common if silence or noise is detected
-        # We return an empty string or a special message to display on the screen
-        return "[...Listening for speech...]"
+        transcription_queue.put("[...No audible speech detected...]")
     except sr.RequestError as e:
-        # API connection error
-        print(f"❌ Could not request results from Google Speech API; {e}")
-        return "[ERROR: Check network connection]"
+        transcription_queue.put(f"[API ERROR: {e}]")
+    except Exception as e:
+        # Capture unexpected errors
+        transcription_queue.put(f"[CRITICAL THREAD ERROR: {e}]")
+        traceback.print_exc()
+    finally:
+        # Ensure the running flag is cleared so main loop may spawn new workers
+        speech_worker_running.clear()
 
-# --- HAND TRACKER CLASS (Included but NOT used in the main loop for this task) ---
-class HandTracker:
-    # Retain the class definition for future use, but it's optional here.
-    # ... (Your original HandTracker class code goes here, but we omit the full content for brevity)
-    def __init__(self, *args, **kwargs):
-        pass # Placeholder for this example
-    def findHands(self, img, draw=True):
-        return img
-    def findPosition(self, img, handNo=0, draw=True):
-        return []
-
-# --- MAIN APPLICATION LOOP (Revised for continuous transcription) ---
+# ---------------------------
+# MAIN LOOP
+# ---------------------------
 def main():
-    cap = cv2.VideoCapture(0)
-    
-    # Transcription settings
-    TIME_TO_LISTEN = 4.0 # How often to call the microphone function (in seconds)
-    last_listen_time = time.time()
-    current_transcription = "Press 'q' to quit. Starting voice transcription soon..."
-    
-    # Initialize HandTracker (it won't be used, but helps if you add ASL later)
-    # tracker = HandTracker() # Uncomment to use the tracker later
+    global last_frame_to_save
 
-    print(f"App running. New transcription cycle every {TIME_TO_LISTEN} seconds.")
+    mic_index = find_default_mic_index()
+    if mic_index is None:
+        print("Fatal: No microphone detected. Exiting.")
+        return
+    else:
+        print(f"Using microphone index: {mic_index}")
 
-    while True:
-        # 1. Video Capture
-        success, img = cap.read()
-        if not success:
-            print("Failed to grab frame.")
-            break
-            
-        # Optional: Flip image for mirror effect
-        img = cv2.flip(img, 1)
+    cap = cv2.VideoCapture(VIDEO_SOURCE)
+    if not cap.isOpened():
+        print(f"Fatal: Cannot open webcam (index {VIDEO_SOURCE}). Exiting.")
+        return
 
-        # 2. Check if it's time to transcribe
-        if time.time() - last_listen_time > TIME_TO_LISTEN:
-            # Block the video feed briefly to listen and transcribe
-            new_text = record_and_transcribe()
-            
-            # Only update the displayed text if the function returned a result
-            if new_text is not None:
-                current_transcription = new_text
-                
-            last_listen_time = time.time() # Reset the timer
+    last_listen_time = 0.0
+    status_text = f"Say '{SCREENSHOT_COMMAND}'. Press 'q' to quit."
+    is_listening = False
+    spinner = ["|", "/", "-", "\\"]
+    spin_idx = 0
 
-        # 3. Display Current Transcription on Screen
-        # Display the instructional prompt
-        cv2.putText(img, "SAY SOMETHING NOW", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        
-        # Display the transcribed text
-        # Use a large font at the bottom of the screen
-        cv2.putText(img, current_transcription, 
-                    (10, 470), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                transcription_queue.put("[❌ Camera read failed]")
+                break
 
-        # 4. Display Image
-        cv2.imshow("Speech to Screen", img)
-        
-        # 5. Handle Quit Key Press
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            print("Quitting program by pressing 'q'.")
-            break
+            # Mirror for natural webcam feel
+            frame = cv2.flip(frame, 1)
 
-    # Cleanup
-    cap.release()
-    cv2.destroyAllWindows()
+            # Store a copy of the current frame (thread-safe)
+            with frame_lock:
+                last_frame_to_save = frame.copy()
+                last_frame_to_save_local = last_frame_to_save  # local reference for safety
+
+            # Start speech worker if interval passed and no worker currently running
+            now = time.time()
+            if not speech_worker_running.is_set() and (now - last_listen_time) >= TIME_TO_LISTEN:
+                last_listen_time = now
+                is_listening = True
+                transcription_queue.put(f"[🎤 Say '{SCREENSHOT_COMMAND}' now...]")
+                t = threading.Thread(target=record_and_transcribe_threaded, args=(mic_index,), daemon=True)
+                t.start()
+
+            # Process transcription status updates (non-blocking)
+            if not transcription_queue.empty():
+                status_text = transcription_queue.get_nowait()
+                # If the worker finished and reported something other than the initial listening message,
+                # consider ourselves no longer "listening" for UI purposes.
+                # We'll rely on the speech_worker_running Event for accurate state.
+                if not speech_worker_running.is_set():
+                    is_listening = False
+
+            # Process commands
+            if not command_queue.empty():
+                cmd = command_queue.get_nowait()
+                if cmd == "TAKE_PICTURE":
+                    # Save using the frame we captured under lock
+                    with frame_lock:
+                        img_to_save = last_frame_to_save_local if 'last_frame_to_save_local' in locals() else None
+                    save_status = take_screenshot(img_to_save)
+                    status_text = save_status
+                    # Make sure listening resets
+                    is_listening = False
+                    # Clear any running worker flag just in case
+                    speech_worker_running.clear()
+
+            # Draw UI elements
+            status_color = (0, 200, 0) if is_listening or speech_worker_running.is_set() else (200, 200, 200)
+            cv2.putText(frame, f"STATUS: {'LISTENING' if (is_listening or speech_worker_running.is_set()) else 'IDLE'} {spinner[spin_idx]}",
+                        (10, 30), FONT, 0.9, status_color, 2, cv2.LINE_AA)
+            spin_idx = (spin_idx + 1) % len(spinner)
+
+            # Wrap status_text to fit screen bottom if necessary
+            txt = status_text
+            # We'll simply draw it once; user can adjust font/size if needed
+            cv2.putText(frame, txt, (10, frame.shape[0] - 20), FONT, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+
+            cv2.imshow(SHOW_WINDOW_NAME, frame)
+
+            # Quit key
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+    except KeyboardInterrupt:
+        print("Interrupted by user.")
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
